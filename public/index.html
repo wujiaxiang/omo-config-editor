@@ -690,8 +690,21 @@ function modelIds(provider) {
   return (provider?.models || []).map(modelId);
 }
 
+// 从 qualified "provider/model" 格式中提取裸模型名
+function bareModel(qualified) {
+  const i = qualified.indexOf('/');
+  return i >= 0 ? qualified.slice(i + 1) : qualified;
+}
+
+// 从 qualified "provider/model" 中提取 provider 名
+function providerFromQualified(qualified) {
+  const i = qualified.indexOf('/');
+  return i >= 0 ? qualified.slice(0, i) : null;
+}
+
 // Working in-memory copy of the 3 chains: { opus: [modelId,...], sonnet: [...], haiku: [...] }
 let ccrChains = null;
+let ccrRetryCount = { opus: 1, sonnet: 1, haiku: 1 };
 
 function buildChainsFromConfig() {
   const rules = ccrConfig.Router?.rules || [];
@@ -704,11 +717,31 @@ function buildChainsFromConfig() {
     sonnet: (sonnetRule?.fallback?.models || []).slice(),
     haiku: (haikuRule?.fallback?.models || []).slice(),
   };
+  ccrRetryCount = {
+    opus: opusRule?.fallback?.retryCount ?? 1,
+    sonnet: sonnetRule?.fallback?.retryCount ?? 1,
+    haiku: haikuRule?.fallback?.retryCount ?? 1,
+  };
 }
 
 function findProviderForModel(modelIdToFind) {
   const providers = ccrConfig.Providers || [];
   if (!modelIdToFind) return null;
+  // 如果有 provider/ 前缀，直接取前缀部分
+  const slashIdx = modelIdToFind.indexOf('/');
+  if (slashIdx > 0) {
+    const providerName = modelIdToFind.slice(0, slashIdx);
+    const bare = modelIdToFind.slice(slashIdx + 1);
+    // 先精确匹配 provider 名
+    if (providers.find(p => p.name === providerName || p.id === providerName)) {
+      return providerName;
+    }
+    // 然后用裸名在 provider 的 models 里找
+    for (const p of providers) {
+      if (modelIds(p).includes(bare)) return p.name;
+    }
+  }
+  // 否则用原始值遍历（兼容裸名查找）
   for (const p of providers) {
     if (modelIds(p).includes(modelIdToFind)) return p.name;
   }
@@ -731,7 +764,8 @@ function renderChainCards() {
   kinds.forEach(kind => {
     const chain = ccrChains[kind.key] || [];
     const primary = chain[0] || '';
-    const primaryProvider = findProviderForModel(primary) || '';
+    const primaryBare = bareModel(primary);
+    const primaryProvider = providerFromQualified(primary) || findProviderForModel(primary) || '';
 
     html += `
     <div class="ccr-provider-card" data-kind="${kind.key}">
@@ -750,7 +784,7 @@ function renderChainCards() {
         </select>
         <select class="chain-primary-model" data-kind="${kind.key}">
           <option value="">-- Model --</option>
-          ${modelIds(providers.find(p => p.name === primaryProvider)).map(m => `<option value="${m}" ${m === primary ? 'selected' : ''}>${m}</option>`).join('')}
+          ${modelIds(providers.find(p => p.name === primaryProvider)).map(m => `<option value="${m}" ${m === primaryBare ? 'selected' : ''}>${m}</option>`).join('')}
         </select>
       </div>
 
@@ -771,6 +805,15 @@ function renderChainCards() {
         </div>
       </div>
 
+      <div style="margin-top: 14px; display: flex; align-items: center; gap: 8px;">
+        <label style="font-size: 12px; color: #8b8fa3;">失败重试次数：</label>
+        <input type="number" class="chain-retry-count" data-kind="${kind.key}"
+               value="${ccrRetryCount[kind.key]}" min="0" max="5"
+               style="width: 60px; padding: 4px 8px; background: #0f1117; border: 1px solid #2a2d3e;
+                      border-radius: 4px; color: #e8eaed; font-size: 13px; text-align: center;">
+        <span style="font-size: 11px; color: #6b6f82;">0=首选失败直接降级</span>
+      </div>
+
       <div class="btn-bar" style="margin-top: 16px; justify-content: flex-start; position: static;">
         <button class="btn btn-primary chain-save-btn" data-kind="${kind.key}">保存 ${kind.label}</button>
       </div>
@@ -783,7 +826,7 @@ function renderChainCards() {
 }
 
 function renderFallbackRow(kind, modelId, indexInChain, chainLength) {
-  const providerName = findProviderForModel(modelId) || '?';
+  const providerName = providerFromQualified(modelId) || findProviderForModel(modelId) || '?';
   const badgeNum = indexInChain + 1; // since primary is ①
   return `
     <div class="fallback-row" data-kind="${kind}" data-model="${modelId}">
@@ -964,7 +1007,9 @@ async function saveChain(kind, btn) {
   }
 
   // 将每个模型名转换为 qualified provider/model 格式，避免多个 provider 有同名模型时降级歧义
+  // 如果已有 provider 前缀（含 '/'），说明已经是 qualified，不要再拼一次
   const qualifyModel = (m) => {
+    if (m.indexOf('/') >= 0) return m; // 已是 qualified，直接返回
     const p = findProviderForModel(m);
     return p ? `${p}/${m}` : m;
   };
@@ -988,16 +1033,30 @@ async function saveChain(kind, btn) {
       name: kind.charAt(0).toUpperCase() + kind.slice(1) + ' fallback chain',
       type: 'condition',
       enabled: true,
+      // condition 必须用 == + 全名，CCR 的 Nm() 只认 == 操作符，ends-with 会被 strip 成 null
+      // CC 通过 cloudcli 发送的一直是全名（如 opencode-zen/mimo-v2.5-free），没有裸名情况
       condition: { left: 'request.body.model', operator: '==', right: qualifiedPrimaryModel },
       fallback: { mode: 'model-chain', models: [], retryCount: 1 }
     };
     ccrConfig.Router.rules.push(rule);
   } else {
-    // 更新已有规则的 condition，使其匹配 CC 实际发送的完整 provider/model 名
-    // 注意：condition 的赋值跟 profile 同步更新，使降级链和默认模型保持一致
     rule.condition = { left: 'request.body.model', operator: '==', right: qualifiedPrimaryModel };
   }
-  if (!rule.fallback) rule.fallback = { mode: 'model-chain', retryCount: 1 };
+  // condition 规则必须有 rewrite 才能被 CCR 标记为 active（否则 fallback 不会被使用）
+  // 加一条无害的 rewrite：把模型名设为自己（无实际效果，但激活规则）
+  rule.rewrites = [{ key: 'request.body.model', operation: 'set', value: qualifiedPrimaryModel }];
+  if (!rule.fallback) rule.fallback = { mode: 'model-chain', models: [], retryCount: 1 };
+  // 从 UI 读取重试次数
+  const retryInput = document.querySelector(`.chain-retry-count[data-kind="${kind}"]`);
+  const retryVal = retryInput ? parseInt(retryInput.value, 10) : 1;
+  if (!Number.isFinite(retryVal) || retryVal < 0) {
+    toast('重试次数必须是 ≥0 的数字', false);
+    btn.disabled = false; btn.textContent = origText; return;
+  }
+  rule.fallback.retryCount = retryVal;
+  ccrRetryCount[kind] = retryVal;
+  // 降级链用全名 (provider/model)，这样失败时直接路由到指定 provider，避免裸名回绕到同个 provider
+  // condition.right 仍用裸名 (ends-with 匹配兼容裸名/全名)
   rule.fallback.models = fullChain;
 
   // Update profile.claudeCode.<kind>Model

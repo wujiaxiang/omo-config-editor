@@ -1,101 +1,123 @@
 # OMO Config Editor
 
-一个 Web UI 工具，用来编辑 OpenCode 的 agent/category 模型映射（OMO JSON）和 Claude Code Router 的路由降级链配置（CCR SQLite）。
+A web UI for editing AI agent model mappings and model gateway routing/fallback chains.
 
-## 项目背景
+> **OMO** = oh-my-openagent, an agent model mapping system for the OpenCode AI framework.  
+> **CCR** = Claude Code Router, a model gateway that routes AI client requests to upstream providers.
 
-这个工具运行在 **CT105**（Proxmox VE LXC 容器，IP `192.168.2.128`）上，是该环境内 Claude Code + CCR 网关体系的一部分。
+## What it does
 
-### 架构位置
+Two editors in one tool:
+
+1. **Agent/Category Model Mapping** — Edit which model each AI agent or task category uses (backed by a JSON config file)
+2. **Model Gateway Routing** — Edit the gateway's provider routing rules, fallback chains, and model aliases (backed by the gateway's config database via RPC)
+
+It connects to the gateway's built-in RPC API for safe writes — no direct database manipulation.
+
+## Architecture
 
 ```
-用户
-  │
-  ├── OpenCode (OMOC) ← 主对话框架
-  │     └── OMO JSON (~/.config/opencode/oh-my-openagent.json)
-  │           ↑ 本工具编辑此文件
-  │
-  └── Claude Code Router (CCR) ← 模型路由网关
-        └── Config SQLite (~/.claude-code-router/config.sqlite)
-              ↑ 本工具也编辑此文件（通过 RPC）
+AI Client (OpenCode / Claude Code CLI / etc.)
+  ├── Agent Model Config (JSON file)
+  │     └── OMO Config Editor edits this (direct file read/write)
+  └── Model Gateway (CCR / LiteLLM / custom)
+        └── Gateway Config (SQLite / DB)
+              └── OMO Config Editor edits this (RPC API only)
 ```
 
-- **OpenCode**：当前正在运行的主 AI 对话框架（替代传统 Claude Code）
-- **OMO (oh-my-openagent)**：OpenCode 的 agent 模型映射系统，用 JSON 强约束每个 agent 使用哪个模型
-- **CCR (Claude Code Router)**：模型路由网关，接收上游请求路由到具体 provider（qclaw / opencode-go / bmwcopilot 等），并支持失败降级链
+- **Agent Model Config**: Maps each agent or task category to a specific model (e.g. `oracle → claude-opus-4.8`, `explore → deepseek-v4-flash`). The framework reads this at startup.
+- **Model Gateway**: A reverse proxy that receives requests from AI clients, routes them to upstream providers, handles model aliasing, and manages failover chains when a provider returns errors or rate-limits.
 
-### 为什么需要这个工具
+### Backend settings (`server.js`)
 
-1. OMO JSON 手动编辑麻烦且容易格式错误
-2. CCR 的 SQLite 不能直接手写（绕过 schema 校验会触发自愈清空）
-3. 两个配置分别在两个地方，分开查效率低且容易配错
-4. 需要一个可视化界面统一管理"哪个 agent 用哪个模型"和"这个模型走哪个 provider / 有没有降级"
+The server reads these from `process.env` or hardcoded defaults:
 
-## 功能
+| Setting | Default | Description |
+|---|---|---|
+| `PORT` | `34560` | HTTP server port |
+| `CONFIG_PATH` | `~/.config/opencode/oh-my-openagent.json` | Path to the agent model JSON |
+| `CCR_DB_PATH` | `~/.claude-code-router/config.sqlite` | Path to the gateway's SQLite database (read fallback only) |
+| `CCR_RPC_URL` | `http://127.0.0.1:3458/api/ccr/rpc` | Gateway RPC endpoint (primary read/write path) |
+| `CCR_RPC_ERROR_LOG` | `/var/log/omo-config-editor-ccr-errors.log` | Log file for RPC failures |
 
-- **OMO Config tab**：编辑 `~/.config/opencode/oh-my-openagent.json`
-  - 列出所有 agent / category
-  - 为每个条目选择模型 + variant（从 `opencode models` 实时拉取）
-  - 模型列表缓存 5 分钟
-- **CCR Models tab**：编辑 CCR 的路由规则和降级链
-  - Opus / Sonnet / Haiku 三条降级链的可视化编辑
-  - Provider → Model 两级联动选择器
-  - 自动补全 condition（`==` + 全名）、rewrites（激活规则所必需）、profile 映射
-  - 重试次数（retryCount）可调
+## Why this exists
 
-## 文件结构
+- The agent model JSON is tedious to edit by hand and easy to break.
+- The gateway's config database must not be written directly — bypassing schema validation can trigger the gateway's self-heal mechanism, wiping the entire config.
+- Two configs that need to stay in sync: "which model does this agent use?" and "which provider/fallback chain serves that model?".
+- A single UI makes it practical to manage both at once.
+
+## Features
+
+### Agent/Category Config
+- Lists all agents and categories from the JSON config
+- Picks available models from `opencode models` (or equivalent CLI; 5-minute cache)
+- Saves back to the JSON file
+
+### Gateway Routing Config
+- Per-model fallback chains: configure which models to try in sequence when the primary fails
+- Provider → Model two-level selector
+- Automatically generates the condition expression (`==` with fully-qualified model name — some gateways strip non-`==` operators like `ends-with`)
+- Automatically adds no-op rewrites (condition-type rules without rewrites may be marked `inactive` in some gateways, making their fallback chains unreachable)
+- Adjustable retry count per chain
+- Saves to the gateway's database via RPC (never by direct DB write)
+
+## Quick start
+
+```bash
+# Install dependencies (once)
+cd omo-config-editor
+npm install
+
+# Start the server
+node server.js
+
+# Open in browser
+# http://localhost:34560
+```
+
+## API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Frontend page |
+| GET / POST | `/api/config` | Read / write agent model JSON |
+| GET | `/api/models` | List available models (5 min cache) |
+| GET | `/api/ccr/config` | Read gateway config (RPC → DB read fallback) |
+| POST | `/api/ccr/config` | Write gateway config (RPC only, no direct DB write) |
+| GET | `/api/ccr/providers` | List gateway providers |
+| GET | `/api/ccr/routes` | List gateway routing rules |
+
+## Design constraints
+
+| Rule | Why |
+|---|---|
+| ❌ Never write the gateway's DB directly | Bypasses schema validation → gateway's self-heal can wipe the config |
+| ❌ Never write the AI client's local settings file | Crosses architecture boundary; client settings belong to the client's domain |
+| ✅ Always write gateway config via RPC | RPC validates schema and keeps the gateway's in-memory config in sync |
+| ✅ Condition must use `==` with fully-qualified model name | Some gateways (CCR) strip non-`==` operators during config normalization (`Nm()`) |
+| ✅ Condition rules need a no-op rewrite | Rules without rewrites can be marked `inactive` (`pTe()` check), skipping their fallback chains |
+
+## File structure
 
 ```
 omo-config-editor/
-├── README.md           ← 本文件（背景 + 快速参考）
-├── AGENTS.md           ← Agent 用文档（字段设计原因 + 技术细节）
-├── server.js           ← Express 后端，提供 API
+├── README.md          ← This file — general project overview
+├── AGENTS.md          ← Technical field-by-field design docs (for AI agent reference)
+├── server.js          ← Express backend
 ├── public/
-│   └── index.html      ← 前端页面（纯 HTML/JS，无需构建）
+│   └── index.html     ← Frontend (vanilla HTML/JS, no build step)
 └── package.json
 ```
 
-## 快速启动
+## Related docs (external, not in this repo)
 
-```bash
-# 安装依赖（只需一次）
-cd /root/omo-config-editor
-npm install
+For in-depth understanding of the gateway's internals and debugging methodology, refer to:
 
-# systemd 管理（推荐）
-systemctl restart omo-config-editor
+- **Gateway config deep-dive**: Provider configuration, rule anatomy, known pitfalls
+- **Troubleshooting methodology**: Evidence pyramid, anti-patterns, systematic debugging
+- These docs are maintained alongside the deployment environment, not in this repository
 
-# 访问
-# http://192.168.2.128:34560
-```
+## License
 
-## 参考文档（不在本 Git 库内）
-
-以下文档位于 CT105 环境中，提供完整的背景知识：
-
-| 文档 | 位置 | 内容 |
-|---|---|---|
-| 环境总览 | `/root/CT105-README.md` | 容器索引、PVE 命令、已知坑 |
-| CCR 配置详解 | `/root/CT105-docs/containers/ccr-claude-code-router.md` | Provider / Rules / Profile 完整字段说明、8 个已知坑、架构边界 |
-| 排查方法论 | `/root/CT105-docs/系统化排查方法论.md` | 复杂问题排查的标准流程、证据金字塔、反模式 |
-| OpenCode 配置 | `~/.config/opencode/oh-my-openagent.json` | OMO JSON 原始文件 |
-
-## 架构约束（重要）
-
-- ✅ 通过 CCR RPC 读写 SQLite（saveConfig / getConfig）
-- ✅ 通过 HTTP API 读写 OMO JSON
-- ❌ **不直接写 SQLite**（绕过 schema 校验会触发 CCR 自愈清空）
-- ❌ **不写 `~/.claude/settings.json`**（越界，应通过 CCR gateway 启动时自动同步）
-- ❌ **不作为通用管理后台**——只管理 CCR 配置和 OMO 配置，不管理 CC 客户端
-
-## 设计决策摘要
-
-| 决策 | 原因 |
-|---|---|
-| condition 用 `==` + 全名 | CCR 的 `Nm()` 不识别 `ends-with`，会 strip 成 null |
-| 每条 rule 自动补 rewrites | condition 规则无 rewrites 则 `active=false`，整个规则被跳过 |
-| retryCount 可调 | 控制每个模型失败后的 HTTP 重试次数，只对 5xx/超时生效，429 不重试 |
-| 降级链 models 用全名 | 避免裸名路由回绕到已失败的 provider |
-| RPC 优先，SQLite 只用做读 fallback | 直接写 SQLite 绕过了 schema 校验，曾多次触发自愈清空 |
-
-详见 `AGENTS.md` 逐字段解释。
+MIT

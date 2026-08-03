@@ -2,3 +2,13 @@ node_modules/
 *.log
 .env
 public/*.log
+
+# >>> tcb-remote-workspace internal ignore rules >>>
+.session-env.json
+.mcporter/
+.skills/
+.capabilities/
+.workspace-info.md
+.local/share/opencode/
+.cloudbase-mcp/logs
+# <<< tcb-remote-workspace internal ignore rules <<<
